@@ -1,26 +1,36 @@
 import sys
 import json
 import os
-import requests
-from openai import OpenAI
+import httpx
+from pathlib import Path
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(".env.agent.secret")
 load_dotenv(".env.docker.secret")
 
-PROJECT_ROOT = os.path.realpath(os.path.dirname(__file__))
 AGENT_API_BASE_URL = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+LMS_API_KEY = os.environ.get("LMS_API_KEY", "")
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the project repository. Use for wiki docs, source code, config files.",
+            "description": (
+                "Read the contents of a local file. Use this to read wiki documentation "
+                "(in the wiki/ directory), backend source code (e.g. main.py, routers/, models.py), "
+                "docker-compose.yml, Dockerfile, or any other project file. "
+                "Use this for questions about how the project works, what framework it uses, "
+                "ETL pipeline logic, request lifecycle, etc."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path from project root."}
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file, e.g. 'wiki/git-workflow.md' or 'backend/main.py'",
+                    }
                 },
                 "required": ["path"],
             },
@@ -30,11 +40,17 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories at a given path in the project repository.",
+            "description": (
+                "List files in a directory. Use this to discover what files exist before reading them. "
+                "Useful for finding all router modules, wiki pages, or source files in a directory."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative directory path from project root."}
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the directory, e.g. 'backend/routers' or 'wiki'",
+                    }
                 },
                 "required": ["path"],
             },
@@ -44,14 +60,28 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "query_api",
-            "description": "Call the deployed backend API. Use auth=true for normal requests, auth=false to test unauthenticated access (e.g. to check what status code the API returns without credentials).",
+            "description": (
+                "Send an HTTP request to the deployed backend API. Use this for questions that require "
+                "live data from the running system: item counts, scores, completion rates, HTTP status codes "
+                "returned by specific endpoints, or any question about the current state of the database. "
+                "Always use this (not read_file) when the question asks to 'query the API', 'query the running API', "
+                "or asks about current data. Authenticate automatically with LMS_API_KEY."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "method": {"type": "string", "description": "HTTP method: GET, POST, etc."},
-                    "path": {"type": "string", "description": "API path, e.g. /items/"},
-                    "body": {"type": "string", "description": "Optional JSON request body."},
-                    "auth": {"type": "boolean", "description": "Whether to include authentication header. Default true. Set false to test unauthenticated requests."},
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method: GET, POST, PUT, DELETE, etc.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path, e.g. '/items/' or '/analytics/completion-rate?lab=lab-99'",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON body for POST/PUT requests.",
+                    },
                 },
                 "required": ["method", "path"],
             },
@@ -59,143 +89,150 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are a system and documentation assistant. You have three tools:
+SYSTEM_PROMPT = """You are a helpful assistant for a software engineering project.
+You have access to three tools:
 
-1. list_files — discover files in the project (wiki, source code, configs)
-2. read_file — read file contents (wiki docs, source code, docker-compose.yml, Dockerfile, etc.)
-3. query_api — call the live backend API (use for item counts, HTTP status codes, analytics, endpoint errors)
+1. read_file — read local project files (wiki docs, source code, config files).
+   Use for: wiki questions, framework/library questions, code logic, ETL pipeline, Dockerfile, docker-compose.yml.
+
+2. list_files — list files in a directory.
+   Use for: discovering what router modules exist, what wiki pages are available.
+
+3. query_api — send HTTP requests to the running backend API.
+   Use for: current data (item counts, scores), HTTP status codes returned by endpoints,
+   endpoint behavior, live error responses.
 
 Decision rules:
-- Questions about wiki, documentation, how-to → use read_file on wiki/
-- Questions about source code, framework, architecture → use list_files then read_file on backend/
-- Questions about live data, item counts, HTTP status codes → use query_api
-- Questions about bugs in endpoints → use query_api with a real lab parameter (e.g. lab=lab-1) to trigger the crash, read the error carefully, then read_file on the analytics router source code to find the exact bug. For top-learners: try GET /analytics/top-learners?lab=lab-1 to reproduce the TypeError, then read the source to explain the sorting bug with None values.
-- Chain tools as needed
+- Question about documentation or wiki → read_file on the wiki/ directory.
+- Question about source code or architecture → read_file on backend/ files.
+- Question about what the API returns, how many items exist, live data → query_api.
+- Question about what files/modules exist → list_files.
+- When diagnosing a bug: first query_api to see the error, then read_file to find the buggy line.
 
-Always include the source when available (file path + section anchor).
-End your response with: SOURCE: <path#anchor> (or SOURCE: none if no wiki source)"""
-
-
-def safe_path(relative_path):
-    full = os.path.realpath(os.path.join(PROJECT_ROOT, relative_path))
-    if not full.startswith(PROJECT_ROOT):
-        raise ValueError(f"Access denied: {relative_path}")
-    return full
+Always use the appropriate tool — do not answer from memory alone when a tool can give the real answer.
+When counting items from an API response that returns a list, count the actual items in the list.
+"""
 
 
-def read_file(path):
+def run_read_file(path: str) -> str:
     try:
-        full = safe_path(path)
-        with open(full, "r", encoding="utf-8") as f:
-            return f.read()
-    except ValueError as e:
-        return str(e)
+        content = Path(path).read_text(encoding="utf-8")
+        # Limit to avoid context overflow
+        if len(content) > 12000:
+            content = content[:12000] + "\n... [truncated]"
+        return content
     except FileNotFoundError:
-        return f"File not found: {path}"
+        return f"Error: file not found: {path}"
+    except Exception as e:
+        return f"Error reading file: {e}"
 
 
-def list_files(path):
+def run_list_files(path: str) -> str:
     try:
-        full = safe_path(path)
-        entries = os.listdir(full)
-        return "\n".join(sorted(entries))
-    except ValueError as e:
-        return str(e)
+        entries = sorted(Path(path).iterdir())
+        lines = [str(e) for e in entries]
+        return "\n".join(lines) if lines else "(empty directory)"
     except FileNotFoundError:
-        return f"Directory not found: {path}"
+        return f"Error: directory not found: {path}"
+    except Exception as e:
+        return f"Error listing directory: {e}"
 
 
-def query_api(method, path, body=None, auth=True):
+def run_query_api(method: str, path: str, body: str = None) -> str:
     url = AGENT_API_BASE_URL.rstrip("/") + path
-    headers = {"Content-Type": "application/json"}
-    if auth:
-        headers["Authorization"] = f"Bearer {os.environ.get('LMS_API_KEY', '')}"
+    headers = {"X-API-Key": LMS_API_KEY, "Content-Type": "application/json"}
     try:
-        resp = requests.request(
+        resp = httpx.request(
             method=method.upper(),
             url=url,
             headers=headers,
-            data=body if body else None,
+            content=body.encode() if body else None,
             timeout=15,
         )
         return json.dumps({"status_code": resp.status_code, "body": resp.text})
     except Exception as e:
-        return json.dumps({"status_code": 0, "body": str(e)})
+        return json.dumps({"status_code": 0, "body": f"Request error: {e}"})
 
 
-def execute_tool(name, args):
+def dispatch_tool(name: str, args: dict) -> str:
     if name == "read_file":
-        return read_file(args["path"])
+        return run_read_file(args["path"])
     elif name == "list_files":
-        return list_files(args["path"])
+        return run_list_files(args["path"])
     elif name == "query_api":
-        return query_api(args["method"], args["path"], args.get("body"), args.get("auth", True))
-    return "Unknown tool"
+        return run_query_api(args["method"], args["path"], args.get("body"))
+    else:
+        return f"Unknown tool: {name}"
 
 
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "No question provided"}))
+        print("Usage: agent.py <question>", file=sys.stderr)
         sys.exit(1)
 
     question = sys.argv[1]
+
     client = OpenAI(
         api_key=os.environ["LLM_API_KEY"],
         base_url=os.environ["LLM_API_BASE"],
     )
+    model = os.environ["LLM_MODEL"]
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
 
-    all_tool_calls = []
-    answer = ""
-    source = ""
+    tool_calls_log = []
+    max_iterations = 10
 
-    for _ in range(10):
-        print("Calling LLM...", file=sys.stderr)
+    for _ in range(max_iterations):
         response = client.chat.completions.create(
-            model=os.environ["LLM_MODEL"],
+            model=model,
             messages=messages,
             tools=TOOLS,
+            tool_choice="auto",
             timeout=60,
         )
 
         msg = response.choices[0].message
 
-        if msg.tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ],
-            })
-            for tc in msg.tool_calls:
-                args = json.loads(tc.function.arguments)
-                result = execute_tool(tc.function.name, args)
-                print(f"Tool: {tc.function.name} {args}", file=sys.stderr)
-                all_tool_calls.append({"tool": tc.function.name, "args": args, "result": result})
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-        else:
-            answer_text = (msg.content or "").strip()
-            if "SOURCE:" in answer_text:
-                parts = answer_text.rsplit("SOURCE:", 1)
-                answer = parts[0].strip()
-                source = parts[1].strip()
-                if source.lower() == "none":
-                    source = ""
-            else:
-                answer = answer_text
-                source = ""
-            break
+        # If no tool calls, we have the final answer
+        if not msg.tool_calls:
+            answer = (msg.content or "").strip()
+            result = {"answer": answer, "tool_calls": tool_calls_log}
+            print(json.dumps(result))
+            return
 
-    output = {"answer": answer, "tool_calls": all_tool_calls}
-    if source:
-        output["source"] = source
-    print(json.dumps(output))
+        # Add assistant message to history
+        messages.append(msg.model_dump(exclude_unset=False))
+
+        # Process each tool call
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except Exception:
+                args = {}
+
+            print(f"[tool] {name}({args})", file=sys.stderr)
+            tool_result = dispatch_tool(name, args)
+
+            tool_calls_log.append({
+                "tool": name,
+                "args": args,
+                "result": tool_result[:500],  # truncate for log
+            })
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": tool_result,
+            })
+
+    # Fallback if max iterations reached
+    result = {"answer": "Max iterations reached without a final answer.", "tool_calls": tool_calls_log}
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":
