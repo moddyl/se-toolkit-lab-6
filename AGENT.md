@@ -88,3 +88,7 @@ The agent uses a detailed system prompt that guides the LLM to:
 
 ```bash
 uv run agent.py "How do you resolve a merge conflict?"
+
+### Data Question
+```bash
+uv run agent.py "How many items are in the database?"
